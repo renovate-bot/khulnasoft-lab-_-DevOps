@@ -1,0 +1,1214 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+%global contentdir %{_datadir}/khulnasoft-lab
+%global version @PACKAGE_VERSION@
+%global go_version @GO_PACKAGE_VERSION@
+%global go_name go.d.plugin
+
+# XXX: We are using automatic `Requires:` generation for libraries
+# whenever possible, DO NOT LIST LIBRARY DEPENDENCIES UNLESS THE RESULTANT
+# PACKAGE IS BROKEN WITHOUT THEM.
+AutoReqProv: yes
+
+# This is temporary and should eventually be resolved. This bypasses
+# the default rhel __os_install_p,ost which throws a python compile
+# error.
+%global __os_install_post %{nil}
+
+# We don’t want LTO as it has a minimal performance impact at runtime
+# but a huge impact on build times (we want our CI to not take multiple
+# hours to finish).
+%global _lto_cflags %nil
+
+# Use our custom CMake version from our package builders if we can’t find cmake.
+%if 0%{?centos_ver} == 7
+%global __cmake /cmake/bin/cmake
+%global __cmake_builddir .
+%global cmake %{__cmake}
+%global cmake_build %{__cmake} --build %{__cmake_builddir} --verbose --parallel $(nproc)
+%global cmake_install DESTDIR="%{buildroot}" %{__cmake} --install %{__cmake_builddir}
+%global _have_ml 0
+%endif
+%if 0%{?amazon_linux} == 2
+%global __cmake /cmake/bin/cmake
+%global __cmake_builddir .
+%global cmake %{__cmake}
+%global cmake_build %{__cmake} --build %{__cmake_builddir} --verbose --parallel $(nproc)
+%global cmake_install DESTDIR="%{buildroot}" %{__cmake} --install %{__cmake_builddir}
+%global _have_ml 0
+%endif
+
+# openSUSE requires us to explicity ask for ninja for builds.
+# We also need to specify the build directory since they do not.
+%if 0%{?suse_version}
+%global __builder ninja
+%global __cmake_builddir %{__builddir}
+%endif
+
+# Disable go.d.plugin build on outdated golang distros
+%if 0%{?centos_ver:1}
+%if 0%{?centos_ver} >= 10 && 0%{?almalinux_ver:1} && 0%{?rocky_ver:1}
+%global _golang_build 1
+%else
+%global _golang_build 0
+%global _missing_build_ids_terminate_build 0
+%endif
+%endif
+
+# Disable eBPF for architectures other than x86
+%ifarch x86_64 i386
+%global _have_ebpf 1
+%else
+%global _have_ebpf 0
+%endif
+
+# Mitigate the cross-distro mayhem by strictly defining the libexec destination
+%define _prefix /usr
+%define _sysconfdir /etc
+%define _localstatedir /var
+%define _libexecdir /usr/libexec
+%define _libdir /usr/lib
+
+# Fedora doesn’t define this, but other distros do
+%{!?_presetdir:%global _presetdir %{_libdir}/systemd/system-preset}
+
+# Redefine centos_ver to standardize on a single macro
+%{?rhel:%global centos_ver %rhel}
+
+# Disable FreeIPMI on Amazon Linux 2023 and newer
+%if 0%{?amzn} >= 2023
+%global _have_freeipmi 0
+%else
+%global _have_freeipmi 1
+%endif
+
+# Disable CUPS on old RHEL systems.
+%if 0%{?centos_ver} != 6 && 0%{?centos_ver} != 7 && 0%{?amazon_linux} != 2
+%global _have_cups 1
+%else
+%global _have_cups 0
+%endif
+
+# Disable NFACCT for RHEL equivalents and Amazon Linux
+%if 0%{?centos_ver} || 0%{?amzn}
+%global _have_nfacct 0
+%else
+%global _have_nfacct 1
+%endif
+
+# Disable xenstat if we’re not on Fedora or openSUSE
+%if 0%{?suse_version} || 0%{?fedora}
+%if 0%{!?amzm:1}
+%global _have_xenstat 0
+%else
+%global _have_xenstat 1
+%endif
+%else
+%global _have_xenstat 0
+%endif
+
+# Skip MongoDB exporter on known problem platforms
+%if 0%{?oraclelinux} || 0%{?suse_version} || 0%{?amzn}
+%global _have_mongo_exporter 0
+%else
+%global _have_mongo_exporter 1
+%endif
+
+# If ML hasn’t been explicitly disabled or enabled yet, enable it now.
+%if 0%{!?_have_ml:1}
+%global _have_ml 1
+%endif
+
+# Filter known bogus deps that would be caught by AutoReqProv.
+%global __requires_exclude_from ^%{_libdir}/%{name}/system/.*$
+
+Summary:	Real-time performance monitoring, done right!
+Name:		khulnasoft-lab
+Version:	%{version}
+Release:	1%{?dist}
+License:	GPLv3+
+Group:		Applications/System
+Source0:	https://github.com/%{name}/%{name}/releases/download/%{version}/%{name}-%{version}.tar.gz
+Source1:	https://github.com/%{name}/%{go_name}/releases/download/v%{go_version}/config.tar.gz
+Source2:	https://github.com/%{name}/%{go_name}/archive/refs/tags/v%{go_version}.tar.gz
+URL:		http://my-%{name}.io
+
+# Remove conflicting EPEL packages
+Obsoletes: %{name}-conf
+Obsoletes: %{name}-data
+
+# #####################################################################
+# Core build/install/runtime dependencies
+# #####################################################################
+
+# Build dependencies
+#
+BuildRequires: gcc
+BuildRequires: gcc-c++
+BuildRequires: make
+BuildRequires: git-core
+BuildRequires: cmake
+%if 0%{!?suse_version:1}
+BuildRequires: ninja-build
+%else
+BuildRequires: ninja
+%endif
+BuildRequires: pkgconfig
+BuildRequires: curl
+BuildRequires: findutils
+BuildRequires: pkgconfig(zlib)
+BuildRequires: pkgconfig(uuid)
+BuildRequires: pkgconfig(libuv)
+BuildRequires: pkgconfig(openssl)
+BuildRequires: pkgconfig(libcurl)
+BuildRequires: pkgconfig(liblz4)
+BuildRequires: pkgconfig(yaml-0.1)
+BuildRequires: pkgconfig(json-c)
+%if 0%{?suse_version}
+# log2journal is not available on these systems
+%else
+BuildRequires: pkgconfig(libpcre2-8)
+%endif
+%if 0%{?suse_version}
+BuildRequires: protobuf-devel
+BuildRequires: libprotobuf-c-devel
+%else
+%if 0%{?fedora}
+BuildRequires: protobuf-devel
+BuildRequires: protobuf-c-devel
+%else
+%if 0%{?centos_ver} >= 8
+BuildRequires: protobuf-devel
+BuildRequires: protobuf-c-devel
+%endif
+%endif
+%endif
+
+# Core build requirements for service install
+%if 0%{?suse_version}
+BuildRequires: systemd-rpm-macros
+%else
+BuildRequires: systemd
+%endif
+
+# Core requirements for the install to succeed
+Requires(pre): /usr/sbin/groupadd
+Requires(pre): /usr/sbin/useradd
+
+# #####################################################################
+# External plugin package dependencies
+# #####################################################################
+# CentOS prior to CentOS 8 does not have a new enough version of RPM
+# to support weak dependencies. Explicitly requiring our default plugins
+# makes it impossible to properly test the packages prior to upload,
+# so we just skip depending on them on CentOS 7.
+%if 0%{?_have_ebpf}
+Requires: %{name}-plugin-ebpf = %{version}
+%endif
+Requires: %{name}-plugin-apps = %{version}
+Requires: %{name}-plugin-pythond = %{version}
+Requires: %{name}-plugin-go = %{version}
+Requires: %{name}-plugin-debugfs = %{version}
+Requires: %{name}-plugin-chartsd = %{version}
+Requires: %{name}-plugin-slabinfo = %{version}
+Requires: %{name}-plugin-perf = %{version}
+%if %{_have_nfacct}
+Requires: %{name}-plugin-nfacct = %{version}
+%endif
+%if %{_have_xenstat}
+Suggests: %{name}-plugin-xenstat = %{version}
+%endif
+%if %{_have_freeipmi} && 0%{?centos_ver} != 6 && 0%{?centos_ver} != 7 && 0%{?amazon_linux} != 2
+Suggests: %{name}-plugin-freeipmi = %{version}
+%endif
+%if 0%{?centos_ver} != 7 && 0%{?amazon_linux} != 2
+%if %{_have_cups}
+Suggests: %{name}-plugin-cups = %{version}
+%endif
+Recommends: %{name}-plugin-systemd-journal = %{version}
+Recommends: %{name}-plugin-logs-management = %{version}
+%else
+Requires: %{name}-plugin-systemd-journal = %{version}
+%endif
+
+
+# #####################################################################
+# Functionality-dependent package dependencies
+# #####################################################################
+# Note: Some or all of the Packages may be found in the EPEL repo,
+# rather than the standard ones
+
+# epbf plugin dependencies
+%if %{_have_ebpf}
+BuildRequires: pkgconfig(libelf)
+%endif
+# end ebpf plugin dependencies
+
+# nfacct plugin dependencies
+%if %{_have_nfacct}
+BuildRequires: pkgconfig(libmnl)
+BuildRequires: pkgconfig(libnetfilter_acct)
+%endif
+# end nfacct plugin dependencies
+
+# freeipmi plugin dependencies
+%if %{_have_freeipmi}
+BuildRequires: pkgconfig(libipmimonitoring)
+%endif
+# end - freeipmi plugin dependencies
+
+# CUPS plugin dependencies
+%if %{_have_cups}
+BuildRequires: cups-devel
+%endif
+# end - cups plugin dependencies
+
+# go.d.plugin dependencies
+%if 0%{?suse_version}
+BuildRequires: go
+%else
+BuildRequires: golang
+%endif
+# end - go.d.plugin plugin dependencies
+
+# systemd-journal dependencies
+BuildRequires: pkgconfig(libsystemd)
+# end - systemd-journal dependencies
+
+# Prometheus remote write dependencies
+%if 0%{?suse_version}
+BuildRequires: snappy-devel
+%else
+%if 0%{?centos_ver} != 7
+BuildRequires: pkgconfig(snappy)
+%else
+BuildRequires: snappy-devel
+%endif
+%endif
+# end - prometheus remote write dependencies
+
+# Xenstat dependencies
+%if %{_have_xenstat}
+BuildRequires: pkgconfig(xenstat)
+BuildRequires: pkgconfig(xenlight)
+%endif
+# end - xenstat dependencies
+
+# MongoDB exporter dependencies
+%if %{_have_mongo_exporter}
+BuildRequires: pkgconfig(libmongoc-1.0)
+%endif
+# end - mongodb expoerter dependencies
+
+# logs-management dependencies
+BuildRequires: bison
+BuildRequires: flex
+# end - logs-management dependencies
+
+# #####################################################################
+# End of dependency management configuration
+# #####################################################################
+
+%description
+  khulnasoft-lab is the fastest way to visualize metrics. It is a resource
+efficient, highly optimized system for collecting and visualizing any
+type of realtime timeseries data, from CPU usage, disk activity, SQL
+queries, API calls, web site visitors, etc.
+  khulnasoft-lab tries to visualize the truth of now, in its greatest detail,
+so that you can get insights of what is happening now and what just
+happened, on your systems and applications.
+
+%prep
+%setup -q -n "%{name}-%{version}"
+# Only bundle protobuf on CentOS 7 or earlier
+%if 0%{?centos_ver:1}
+%if %{centos_ver} < 8
+export CFLAGS="${CFLAGS} -fPIC" && ${RPM_BUILD_DIR}/%{name}-%{version}/packaging/bundle-protobuf.sh ${RPM_BUILD_DIR}/%{name}-%{version}
+%endif
+%endif
+%if 0%{?_have_ebpf}
+%if 0%{?centos_ver:1}
+%if %{centos_ver} < 8
+export CFLAGS="${CFLAGS} -fPIC" && ${RPM_BUILD_DIR}/%{name}-%{version}/packaging/bundle-libbpf.sh ${RPM_BUILD_DIR}/%{name}-%{version} centos7
+export CFLAGS="${CFLAGS} -fPIC" && ${RPM_BUILD_DIR}/%{name}-%{version}/packaging/bundle-ebpf-co-re.sh ${RPM_BUILD_DIR}/%{name}-%{version}
+%else
+export CFLAGS="${CFLAGS} -fPIC" && ${RPM_BUILD_DIR}/%{name}-%{version}/packaging/bundle-libbpf.sh ${RPM_BUILD_DIR}/%{name}-%{version} centos8
+export CFLAGS="${CFLAGS} -fPIC" && ${RPM_BUILD_DIR}/%{name}-%{version}/packaging/bundle-ebpf-co-re.sh ${RPM_BUILD_DIR}/%{name}-%{version}
+%endif
+%else
+export CFLAGS="${CFLAGS} -fPIC" && ${RPM_BUILD_DIR}/%{name}-%{version}/packaging/bundle-libbpf.sh ${RPM_BUILD_DIR}/%{name}-%{version} other
+export CFLAGS="${CFLAGS} -fPIC" && ${RPM_BUILD_DIR}/%{name}-%{version}/packaging/bundle-ebpf-co-re.sh ${RPM_BUILD_DIR}/%{name}-%{version}
+%endif
+%endif
+
+# go.d.plugin
+%if 0%{?_golang_build}
+mkdir -p "%{_builddir}/%{go_name}"
+tar -xzf "%{SOURCE1}" -C "%{_builddir}/%{go_name}"
+tar -xzf "%{SOURCE2}" -C "%{_builddir}/%{go_name}"
+cd "%{_builddir}/%{go_name}/%{go_name}-%{go_version}"
+make download
+%endif
+
+%build
+# Conf step
+%cmake -G Ninja \
+	-DCMAKE_INSTALL_PREFIX=/ \
+	%if %{_have_cups}
+	-DENABLE_PLUGIN_CUPS=On \
+	%else
+	-DENABLE_PLUGIN_CUPS=Off \
+	%endif
+	%if %{_have_ebpf}
+	-DENABLE_PLUGIN_EBPF=On \
+	%else
+	-DENABLE_PLUGIN_EBPF=Off \
+	%endif
+	%if %{_have_freeipmi}
+	-DENABLE_PLUGIN_FREEIPMI=On \
+	%else
+	-DENABLE_PLUGIN_FREEIPMI=Off \
+	%endif
+	%if %{_have_nfacct}
+	-DENABLE_PLUGIN_NFACCT=On \
+	%else
+	-DENABLE_PLUGIN_NFACCT=Off \
+	%endif
+	%if %{_have_xenstat}
+	-DENABLE_PLUGIN_XENSTAT=On \
+	%else
+	-DENABLE_PLUGIN_XENSTAT=Off \
+	%endif
+	%if 0%{?centos_ver:1}
+	%if %{centos_ver} < 8
+	-DENABLE_BUNDLED_PROTOBUF=On \
+	%else
+	-DENABLE_BUNDLED_PROTOBUF=Off \
+	%endif
+	%else
+	-DENABLE_BUNDLED_PROTOBUF=Off \
+	%endif
+	%if %{_have_ml}
+	-DENABLE_ML=On \
+	%else
+	-DENABLE_ML=Off \
+	%endif
+	%if %{_have_mongo_exporter}
+	-DENABLE_EXPORTER_MONGODB=On \
+	%else
+	-DENABLE_EXPORTER_MONGODB=Off \
+	%endif
+	-DENABLE_ACLK=On \
+	-DENABLE_CLOUD=On \
+	-DENABLE_DBENGINE=On \
+	-DENABLE_H2O=On \
+	-DENABLE_PLUGIN_APPS=On \
+	-DENABLE_PLUGIN_CGROUP_NETWORK=On \
+	-DENABLE_PLUGIN_DEBUGFS=On \
+	-DENABLE_PLUGIN_LOCAL_LISTENERS=On \
+	-DENABLE_PLUGIN_PERF=On \
+	-DENABLE_PLUGIN_SLABINFO=On \
+	-DENABLE_PLUGIN_SYSTEMD_JOURNAL=On \
+	-DENABLE_PLUGIN_LOGS_MANAGEMENT=On \
+	-DENABLE_EXPORTER_PROMETHEUS_REMOTE_WRITE=On \
+	-DENABLE_BUNDLED_JSONC=Off \
+	-DENABLE_BUNDLED_YAML=Off
+
+# Build step
+%{cmake_build}
+
+# Build go.d.plugin
+%if 0%{?_golang_build}
+cd "%{_builddir}/%{go_name}/%{go_name}-%{go_version}"
+sed -i 's|CGO_ENABLED=0 ||' "hack/go-build.sh"
+TRAVIS_TAG="%{go_version}" %{__make} build
+%endif
+
+%install
+
+# ###########################################################
+# Clear the directory, if already exists and install
+rm -rf "${RPM_BUILD_ROOT}"
+%{cmake_install}
+
+install -m 644 -p "system/%{name}.conf" "${RPM_BUILD_ROOT}%{_sysconfdir}/%{name}"
+
+# ###########################################################
+# Install updater script
+install -m 755 -p packaging/installer/%{name}-updater.sh "${RPM_BUILD_ROOT}%{_libexecdir}/%{name}/%{name}-updater.sh"
+
+# ###########################################################
+# logrotate settings
+install -m 755 -d "${RPM_BUILD_ROOT}%{_sysconfdir}/logrotate.d"
+install -m 644 -p "%{__cmake_builddir}/system/logrotate/%{name}" "${RPM_BUILD_ROOT}%{_sysconfdir}/logrotate.d/%{name}"
+
+# ###########################################################
+# Install freeipmi
+#%if 0%{?_have_freeipmi}
+#install -m 4750 -p freeipmi.plugin "${RPM_BUILD_ROOT}%{_libexecdir}/%{name}/plugins.d/freeipmi.plugin"
+#%endif
+
+# ###########################################################
+# Install apps.plugin
+#install -m 4750 -p apps.plugin "${RPM_BUILD_ROOT}%{_libexecdir}/%{name}/plugins.d/apps.plugin"
+
+# ###########################################################
+# Install debugfs.plugin
+#install -m 0750 -p debugfs.plugin "${RPM_BUILD_ROOT}%{_libexecdir}/%{name}/plugins.d/debugfs.plugin"
+
+# ###########################################################
+# Install systemd-journal.plugin
+#install -m 4750 -p systemd-journal.plugin "${RPM_BUILD_ROOT}%{_libexecdir}/%{name}/plugins.d/systemd-journal.plugin"
+
+# ###########################################################
+# Install logs-management.plugin
+#install -m 4750 -p logs-management.plugin "${RPM_BUILD_ROOT}%{_libexecdir}/%{name}/plugins.d/logs-management.plugin"
+
+# ###########################################################
+# Install perf.plugin
+#install -m 4750 -p perf.plugin "${RPM_BUILD_ROOT}%{_libexecdir}/%{name}/plugins.d/perf.plugin"
+
+# ###########################################################
+# Install ebpf.plugin
+#%if 0%{?_have_ebpf}
+#install -m 4750 -p ebpf.plugin "${RPM_BUILD_ROOT}%{_libexecdir}/%{name}/plugins.d/ebpf.plugin"
+#%endif
+
+# ###########################################################
+# Install cups.plugin
+#%if 0%{?centos_ver} != 6 && 0%{?centos_ver} != 7
+#install -m 0750 -p cups.plugin "${RPM_BUILD_ROOT}%{_libexecdir}/%{name}/plugins.d/cups.plugin"
+#%endif
+
+# ###########################################################
+# Install slabinfo.plugin
+#install -m 4750 -p slabinfo.plugin "${RPM_BUILD_ROOT}%{_libexecdir}/%{name}/plugins.d/slabinfo.plugin"
+
+# ###########################################################
+# Install cache and log directories
+install -m 755 -d "${RPM_BUILD_ROOT}%{_localstatedir}/cache/%{name}"
+install -m 755 -d "${RPM_BUILD_ROOT}%{_localstatedir}/log/%{name}"
+
+# ###########################################################
+# Install registry directory
+install -m 755 -d "${RPM_BUILD_ROOT}%{_localstatedir}/lib/%{name}/registry"
+
+# ###########################################################
+# Install uninstaller script
+install -m 750 -p packaging/installer/%{name}-uninstaller.sh \
+"${RPM_BUILD_ROOT}%{_libexecdir}/%{name}/%{name}-uninstaller.sh"
+
+# ###########################################################
+# Install khulnasoft-lab service
+
+install -m 755 -d "${RPM_BUILD_ROOT}%{_unitdir}"
+%if 0%{?centos_ver} != 7 && 0%{?amazon_linux} != 2
+install -m 644 -p "%{__cmake_builddir}/system/systemd/%{name}.service" "${RPM_BUILD_ROOT}%{_unitdir}/%{name}.service"
+%else
+install -m 644 -p "%{__cmake_builddir}/system/systemd/%{name}.service.v235" "${RPM_BUILD_ROOT}%{_unitdir}/%{name}.service"
+%endif
+install -m 755 -d "${RPM_BUILD_ROOT}%{_presetdir}"
+install -m 644 -p "system/systemd/50-%{name}.preset" "${RPM_BUILD_ROOT}%{_presetdir}/50-%{name}.preset"
+
+# ############################################################
+# Package Go within khulnasoft-lab
+
+# Install builded go.d.plugin
+%if 0%{?_golang_build}
+install -m 0640 "%{_builddir}/%{go_name}/%{go_name}-%{go_version}/bin/godplugin" \
+"${RPM_BUILD_ROOT}%{_libexecdir}/%{name}/plugins.d/%{go_name}"
+cp -r "%{_builddir}/%{go_name}/go.d.conf" "%{_builddir}/%{go_name}/go.d" \
+"${RPM_BUILD_ROOT}%{_libdir}/%{name}/conf.d/"
+%else
+# Install binary go.d.plugin
+safe_sha256sum() {
+	# Within the context of the installer, we only use -c option that is common between the two commands
+	# We will have to reconsider if we start non-common options
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum $@
+	elif command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 $@
+	else
+		fatal "I could not find a suitable checksum binary to use"
+	fi
+}
+
+download_go() {
+	url="${1}"
+	dest="${2}"
+
+	if command -v curl >/dev/null 2>&1; then
+		curl -sSL --connect-timeout 10 --retry 3 "${url}" > "${dest}"
+	elif command -v wget >/dev/null 2>&1; then
+		wget -T 15 -O - "${url}" > "${dest}"
+	else
+		echo >&2
+		echo >&2 "Downloading go.d plugin from '${url}' failed because of missing mandatory packages."
+		echo >&2 "Either add packages or disable it by issuing '--disable-go' in the installer"
+		echo >&2
+		exit 1
+	fi
+}
+
+install_go() {
+	# When updating this value, ensure correct checksums in packaging/go.d.checksums
+	GO_PACKAGE_VERSION="$(cat packaging/go.d.version)"
+	ARCH_MAP=(
+		'i386::386'
+		'i686::386'
+		'x86_64::amd64'
+		'aarch64::arm64'
+		'armv64::arm64'
+		'armv6l::arm'
+		'armv7l::arm'
+		'armv5tel::arm'
+	)
+
+	if [ -z "${NETDATA_DISABLE_GO+x}" ]; then
+		ARCH="%{_arch}"
+		OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+
+		echo >&2 "Install go.d.plugin (ARCH=${ARCH}, OS=${OS})"
+
+		for index in "${ARCH_MAP[@]}" ; do
+			KEY="${index%%::*}"
+			VALUE="${index##*::}"
+			if [ "$KEY" = "$ARCH" ]; then
+				ARCH="${VALUE}"
+				break
+			fi
+		done
+		tmp=$(mktemp -d /tmp/khulnasoft-lab-go-XXXXXX)
+		GO_PACKAGE_BASENAME="go.d.plugin-${GO_PACKAGE_VERSION}.${OS}-${ARCH}.tar.gz"
+		download_go "https://github.com/khulnasoft-lab/go.d.plugin/releases/download/${GO_PACKAGE_VERSION}/${GO_PACKAGE_BASENAME}" "${tmp}/${GO_PACKAGE_BASENAME}"
+		download_go "https://github.com/khulnasoft-lab/go.d.plugin/releases/download/${GO_PACKAGE_VERSION}/config.tar.gz" "${tmp}/config.tar.gz"
+
+		if [ ! -f "${tmp}/${GO_PACKAGE_BASENAME}" ] || [ ! -f "${tmp}/config.tar.gz" ] || [ ! -s "${tmp}/config.tar.gz" ] || [ ! -s "${tmp}/${GO_PACKAGE_BASENAME}" ]; then
+			echo >&2 "Either check the error or consider disabling it by issuing '--disable-go' in the installer"
+			echo >&2
+			return 1
+		fi
+
+		grep "${GO_PACKAGE_BASENAME}\$" "packaging/go.d.checksums" > "${tmp}/sha256sums.txt" 2>/dev/null
+		grep "config.tar.gz" "packaging/go.d.checksums" >> "${tmp}/sha256sums.txt" 2>/dev/null
+
+		# Checksum validation
+		if ! (cd "${tmp}" && safe_sha256sum -c "sha256sums.txt"); then
+
+			echo >&2 "go.d plugin checksum validation failure."
+			echo >&2 "Either check the error or consider disabling it by issuing '--disable-go' in the installer"
+			echo >&2
+
+			echo "go.d.plugin package files checksum validation failed."
+			exit 1
+		fi
+
+		# Install files
+		tar -xf "${tmp}/config.tar.gz" -C "${RPM_BUILD_ROOT}%{_libdir}/%{name}/conf.d/"
+		tar xf "${tmp}/${GO_PACKAGE_BASENAME}"
+		mv "${GO_PACKAGE_BASENAME/\.tar\.gz/}" "go.d.plugin"
+		rm -rf "${tmp}"
+	fi
+	return 0
+}
+install_go
+install -m 0640 -p "%{go_name}" "${RPM_BUILD_ROOT}%{_libexecdir}/%{name}/plugins.d/%{go_name}"
+%endif
+
+%if 0%{?_have_ebpf}
+${RPM_BUILD_DIR}/%{name}-%{version}/packaging/bundle-ebpf.sh ${RPM_BUILD_DIR}/%{name}-%{version} \
+${RPM_BUILD_ROOT}%{_libexecdir}/%{name}/plugins.d
+%endif
+
+%pre
+
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+if ! getent passwd %{name} > /dev/null; then
+  useradd --system -g %{name} --home %{contentdir} --no-create-home -s /sbin/nologin -c "Khulnasoft-lab pseudo user" %{name}
+fi
+
+# I am not sure that the corresponding group names are exactly the same as in Debian, but we should start somewhere, shouldn't we?
+for item in docker nginx varnish haproxy adm nsd proxy squid ceph nobody I2C; do
+  if getent group $item > /dev/null 2>&1; then
+    usermod -a -G ${item} %{name}
+  fi
+done
+
+%post
+%if 0%{?suse_version}
+%service_add_post %{name}.service
+%else
+%systemd_post %{name}.service
+%endif
+
+%preun
+%if 0%{?suse_version}
+%service_del_preun %{name}.service
+%else
+%systemd_preun %{name}.service
+%endif
+
+%postun
+%if 0%{?suse_version}
+%service_del_postun %{name}.service
+%else
+%systemd_postun_with_restart %{name}.service
+%endif
+
+%clean
+rm -rf "${RPM_BUILD_ROOT}"
+
+%files
+%doc README.md
+%config(noreplace) %{_sysconfdir}/%{name}/%{name}.conf
+%config(noreplace) %{_sysconfdir}/%{name}/%{name}-updater.conf
+%attr(0755,root,khulnasoft-lab) %{_sysconfdir}/%{name}/edit-config
+%attr(0644,root,khulnasoft-lab) %{_sysconfdir}/%{name}/.install-type
+%dir %{_sysconfdir}/%{name}/health.d
+%dir %{_sysconfdir}/%{name}/statsd.d
+%config(noreplace) %{_sysconfdir}/logrotate.d/%{name}
+%{_libdir}/%{name}
+%{_sbindir}/%{name}
+%{_sbindir}/khulnasoft-labcli
+%if 0%{?suse_version}
+# log2journal is not available on these systems
+%else
+%{_sbindir}/log2journal
+%endif
+%{_sbindir}/systemd-cat-native
+%{_sbindir}/%{name}-claim.sh
+
+%{_unitdir}/%{name}.service
+%{_presetdir}/50-%{name}.preset
+
+%dir %{_libexecdir}/%{name}
+%dir %{_libexecdir}/%{name}/plugins.d
+%defattr(0750,root,khulnasoft-lab,0750)
+%{_libexecdir}/%{name}/install-service.sh
+%{_libexecdir}/%{name}/%{name}-updater.sh
+%{_libexecdir}/%{name}/%{name}-uninstaller.sh
+%{_libexecdir}/%{name}/plugins.d/acl.sh
+%{_libexecdir}/%{name}/plugins.d/alarm.sh
+%{_libexecdir}/%{name}/plugins.d/alarm-email.sh
+%{_libexecdir}/%{name}/plugins.d/alarm-notify.sh
+%{_libexecdir}/%{name}/plugins.d/alarm-test.sh
+%{_libexecdir}/%{name}/plugins.d/anonymous-statistics.sh
+%{_libexecdir}/%{name}/plugins.d/cgroup-name.sh
+%{_libexecdir}/%{name}/plugins.d/get-kubernetes-labels.sh
+%{_libexecdir}/%{name}/plugins.d/health-cmdapi-test.sh
+%{_libexecdir}/%{name}/plugins.d/ioping.plugin
+%{_libexecdir}/%{name}/plugins.d/loopsleepms.sh.inc
+%{_libexecdir}/%{name}/plugins.d/request.sh
+%{_libexecdir}/%{name}/plugins.d/system-info.sh
+%{_libexecdir}/%{name}/plugins.d/tc-qos-helper.sh
+%{_libexecdir}/%{name}/plugins.d/template_dim.sh
+%{_libexecdir}/%{name}/plugins.d/ebpf_thread_function.sh
+
+# cgroup-network detects the network interfaces of CGROUPs
+# it must be able to use setns() and run cgroup-network-helper.sh as root
+# the helper script reads /proc/PID/fdinfo/* files, runs virsh, etc.
+%attr(4750,root,khulnasoft-lab) %{_libexecdir}/%{name}/plugins.d/cgroup-network
+%attr(0750,root,khulnasoft-lab) %{_libexecdir}/%{name}/plugins.d/cgroup-network-helper.sh
+
+# local-listeners detects the local processes that are listening for connections
+%attr(4750,root,khulnasoft-lab) %{_libexecdir}/%{name}/plugins.d/local-listeners
+
+# ndsudo a helper to run privileged commands
+%attr(4750,root,khulnasoft-lab) %{_libexecdir}/%{name}/plugins.d/ndsudo
+
+# Enforce 0644 for files and 0755 for directories
+# for the khulnasoft-lab web directory
+%defattr(0644,root,root,0755)
+%{_datadir}/%{name}/web
+
+# Enforce 0660 for files and 0770 for directories
+# for the khulnasoft-lab lib, cache and log dirs
+%defattr(0660,root,khulnasoft-lab,0770)
+%attr(0770,khulnasoft-lab,khulnasoft-lab) %dir %{_localstatedir}/cache/%{name}
+%attr(0755,khulnasoft-lab,root) %dir %{_localstatedir}/log/%{name}
+%attr(0770,khulnasoft-lab,khulnasoft-lab) %dir %{_localstatedir}/lib/%{name}
+%attr(0770,khulnasoft-lab,khulnasoft-lab) %dir %{_localstatedir}/lib/%{name}/registry
+%attr(0770,khulnasoft-lab,khulnasoft-lab) %dir %{_localstatedir}/lib/%{name}/cloud.d
+
+# Free IPMI belongs to a different sub-package
+%if %{_have_freeipmi}
+%exclude %{_libexecdir}/%{name}/plugins.d/freeipmi.plugin
+%endif
+
+# NFACCT belongs to a different sub-package
+%if %{_have_nfacct}
+%exclude %{_libexecdir}/%{name}/plugins.d/nfacct.plugin
+%endif
+
+# Charts.d belongs to a different sub-package
+%exclude %{_libexecdir}/%{name}/plugins.d/charts.d.plugin
+%exclude %{_libexecdir}/%{name}/plugins.d/charts.d.dryrun-helper.sh
+%exclude %{_libexecdir}/%{name}/charts.d/
+%exclude %{_libdir}/%{name}/conf.d/charts.d.conf
+%exclude %{_libdir}/%{name}/conf.d/charts.d/
+
+# eBPF belongs to a different sub-package
+%if %{_have_ebpf}
+%exclude %{_libexecdir}/%{name}/plugins.d/ebpf.plugin
+%exclude %{_libdir}/%{name}/conf.d/ebpf.d.conf
+%exclude %{_libdir}/%{name}/conf.d/ebpf.d
+%exclude %{_libexecdir}/%{name}/plugins.d/ebpf.d
+%endif
+
+# Python.d belongs to a different sub-package
+%exclude %{_libexecdir}/%{name}/plugins.d/python.d.plugin
+%exclude %{_libexecdir}/%{name}/python.d
+%exclude %{_libdir}/%{name}/conf.d/python.d.conf
+%exclude %{_libdir}/%{name}/conf.d/python.d
+
+# Go.d belongs to a different sub-package
+%exclude %{_libexecdir}/%{name}/plugins.d/%{go_name}
+%exclude %{_libdir}/%{name}/conf.d/go.d.conf
+%exclude %{_libdir}/%{name}/conf.d/go.d
+
+# apps belongs to a different sub-package
+%exclude %{_libexecdir}/%{name}/plugins.d/apps.plugin
+%exclude %{_libdir}/%{name}/conf.d/apps_groups.conf
+
+# slabinfo belongs to a different sub-package
+%exclude %{_libexecdir}/%{name}/plugins.d/slabinfo.plugin
+
+# perf belongs to a different sub-package
+%exclude %{_libexecdir}/%{name}/plugins.d/perf.plugin
+
+# systemd-journal belongs to a different sub-package
+%exclude %{_libexecdir}/%{name}/plugins.d/systemd-journal.plugin
+
+# xenstat belongs to a different sub-package
+%exclude %{_libexecdir}/%{name}/plugins.d/xenstat.plugin
+
+# logs management belongs to a different sub-package
+%exclude %{_libexecdir}/%{name}/plugins.d/logs-management.plugin
+%exclude %{_libdir}/%{name}/conf.d/logsmanagement.d.conf
+%exclude %{_libdir}/%{name}/conf.d/logsmanagement.d
+
+# CUPS belongs to a different sub package
+%if %{_have_cups}
+%exclude %{_libexecdir}/%{name}/plugins.d/cups.plugin
+
+%package plugin-cups
+Summary: The CUPS metrics collection plugin for the Khulnasoft-lab Agent
+Group: Applications/System
+Requires: %{name} = %{version}
+
+%description plugin-cups
+ This plugin allows the Khulnasoft-lab Agent to collect metrics from the Common UNIX Printing System.
+
+%pre plugin-cups
+
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+%files plugin-cups
+%attr(0750,root,khulnasoft-lab) %{_libexecdir}/%{name}/plugins.d/cups.plugin
+%endif
+
+%if 0%{?_have_freeipmi}
+%package plugin-freeipmi
+Summary: The FreeIPMI metrics collection plugin for the Khulnasoft-lab Agent
+Group: Applications/System
+Requires: freeipmi
+Requires: %{name} = %{version}
+
+%description plugin-freeipmi
+ This plugin allows the Khulnasoft-lab Agent to collect metrics from hardware using FreeIPMI.
+
+%pre plugin-freeipmi
+
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+%files plugin-freeipmi
+%attr(4750,root,khulnasoft-lab) %{_libexecdir}/%{name}/plugins.d/freeipmi.plugin
+%endif
+
+%if %{_have_nfacct}
+%package plugin-nfacct
+Summary: The NFACCT metrics collection plugin for the Khulnasoft-lab Agent
+Group: Applications/System
+Requires: %{name} = %{version}
+Conflicts: %{name} < %{version}
+
+%description plugin-nfacct
+ This plugin allows the Khulnasoft-lab Agent to collect metrics from the firewall using NFACCT objects.
+
+%pre plugin-nfacct
+
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+%files plugin-nfacct
+%attr(4750,root,khulnasoft-lab) %{_libexecdir}/%{name}/plugins.d/nfacct.plugin
+%endif
+
+%package plugin-chartsd
+Summary: The charts.d metrics collection plugin for the Khulnasoft-lab Agent
+Group: Applications/System
+Requires: bash
+Requires: %{name} = %{version}
+Conflicts: %{name} < %{version}
+%if 0%{?centos_ver} != 7
+Suggests: nut
+Suggests: apcupsd
+Suggests: iw
+Suggests: sudo
+%endif
+
+%description plugin-chartsd
+ This plugin adds a selection of additional collectors written in shell script to the Khulnasoft-lab Agent.
+It includes collectors for NUT, APCUPSD, LibreSWAN, OpenSIPS, and Wireless access point statistics.
+
+%pre plugin-chartsd
+
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+%files plugin-chartsd
+%defattr(0750,root,khulnasoft-lab,0750)
+%{_libexecdir}/%{name}/plugins.d/charts.d.plugin
+%{_libexecdir}/%{name}/plugins.d/charts.d.dryrun-helper.sh
+%{_libexecdir}/%{name}/charts.d/
+%defattr(0644,root,khulnasoft-lab,0755)
+%{_libdir}/%{name}/conf.d/charts.d.conf
+%{_libdir}/%{name}/conf.d/charts.d/
+
+%if 0%{?_have_ebpf}
+%package plugin-ebpf
+Summary: The eBPF metrics collection plugin for the Khulnasoft-lab Agent
+Group: Applications/System
+Requires: %{name} = %{version}
+Conflicts: %{name} < %{version}
+%if 0%{?centos_ver} != 7
+Recommends: %{name}-plugin-apps = %{version}
+Recommends: %{name}-ebpf-legacy-code >= %{version}
+%else
+Requires: %{name}-plugin-apps = %{version}
+Requires: %{name}-ebpf-legacy-code >= %{version}
+%endif
+
+%description plugin-ebpf
+ This plugin allows the Khulnasoft-lab Agent to use eBPF code to collect more detailed kernel-level metrics for the system.
+
+%pre plugin-ebpf
+
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+%files plugin-ebpf
+%defattr(4750,root,khulnasoft-lab,4750)
+%{_libexecdir}/%{name}/plugins.d/ebpf.plugin
+%defattr(0644,root,khulnasoft-lab,0755)
+%{_libdir}/%{name}/conf.d/ebpf.d.conf
+%{_libdir}/%{name}/conf.d/ebpf.d
+
+%package ebpf-legacy-code
+Summary: Compiled eBPF legacy code for the Khulnasoft-lab eBPF plugin
+Group: Applications/System
+Requires: %{name}-plugin-ebpf = %{version}
+Conflicts: %{name} < %{version}
+
+%description ebpf-legacy-code
+ This package provides the pre-compiled eBPF legacy code for use by the Khulnasoft-lab eBPF plugin.
+ This code is only needed when using the eBPF plugin with kernel versions before 5.10.
+
+%pre ebpf-legacy-code
+
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+%files ebpf-legacy-code
+%defattr(0640,root,khulnasoft-lab,0640)
+%{_libexecdir}/%{name}/plugins.d/ebpf.d/*.o
+
+%endif
+
+%package plugin-pythond
+Summary: The python.d metrics collection plugin for the Khulnasoft-lab Agent
+Group: Applications/System
+Requires: %{name} = %{version}
+Conflicts: %{name} < %{version}
+%if 0%{?centos_ver} == 7 || 0%{?centos_ver} == 6
+Requires: python
+%else
+Requires: python3
+%endif
+%if 0%{?centos_ver} != 7
+Suggests: sudo
+%endif
+
+%description plugin-pythond
+ This plugin adds a selection of additional collectors written in Python to the Khulnasoft-lab Agent.
+Many of the collectors provided by this package are also available in khulnasoft-lab-plugin-go. In msot cases, you probably
+want to use those versions instead of the Python versions.
+
+%pre plugin-pythond
+
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+%files plugin-pythond
+%defattr(0750,root,khulnasoft-lab,0750)
+%{_libexecdir}/%{name}/plugins.d/python.d.plugin
+%{_libexecdir}/%{name}/python.d
+%defattr(0644,root,khulnasoft-lab,0755)
+%{_libdir}/%{name}/conf.d/python.d.conf
+%{_libdir}/%{name}/conf.d/python.d
+
+%package plugin-go
+Summary: The go.d metrics collection plugin for the Khulnasoft-lab Agent
+Group: Applications/System
+Requires: %{name} = %{version}
+Conflicts: %{name} < %{version}
+%if 0%{?centos_ver} != 7
+Suggests: nvme-cli
+Suggests: sudo
+%endif
+
+%description plugin-go
+ This plugin adds a selection of additional collectors written in Go to the Khulnasoft-lab Agent
+A significant percentage of the application specific collectors provided by Khulnasoft-lab are part of this plugin,
+so most users will want it installed.
+
+%pre plugin-go
+
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+%files plugin-go
+%defattr(0750,root,khulnasoft-lab,0750)
+# CAP_NET_ADMIN needed for WireGuard collector
+# CAP_NET_RAW needed for ping collector
+%caps(cap_net_admin,cap_net_raw=eip) %{_libexecdir}/%{name}/plugins.d/%{go_name}
+%defattr(0644,root,khulnasoft-lab,0755)
+%{_libdir}/%{name}/conf.d/go.d.conf
+%{_libdir}/%{name}/conf.d/go.d
+
+%package plugin-apps
+Summary: The per-application metrics collection plugin for the Khulnasoft-lab Agent
+Group: Applications/System
+Requires: %{name} = %{version}
+Conflicts: %{name} < %{version}
+
+%description plugin-apps
+ This plugin allows the Khulnasoft-lab Agent to collect per-application and per-user metrics without using cgroups.
+
+%pre plugin-apps
+
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+%files plugin-apps
+%defattr(0750,root,khulnasoft-lab,0750)
+# CAP_DAC_READ_SEARCH and CAP_SYS_PTRACE needed for data collection by the plugin.
+%caps(cap_dac_read_search,cap_sys_ptrace=ep) %{_libexecdir}/%{name}/plugins.d/apps.plugin
+%defattr(0644,root,khulnasoft-lab,0755)
+%{_libdir}/%{name}/conf.d/apps_groups.conf
+
+%package plugin-slabinfo
+Summary: The slabinfo metrics collector for the Khulnasoft-lab Agent
+Group: Applications/System
+Requires: %{name} = %{version}
+Conflicts: %{name} < %{version}
+
+%description plugin-slabinfo
+ This plugin allows the Khulnasoft-lab Agent to collect perfromance and utilization metrics for the Linux kernel’s SLAB allocator.
+
+%pre plugin-slabinfo
+
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+%files plugin-slabinfo
+%defattr(0750,root,khulnasoft-lab,0750)
+# CAP_DAC_READ_SEARCH needed to access the files the plugin reads to collect data.
+%caps(cap_dac_read_search=ep) %{_libexecdir}/%{name}/plugins.d/slabinfo.plugin
+
+%package plugin-perf
+Summary: The perf metrics collector for the Khulnasoft-lab Agent
+Group: Applications/System
+Requires: %{name} = %{version}
+Conflicts: %{name} < %{version}
+
+%description plugin-perf
+ This plugin allows the Khulnasoft-lab to collect metrics from the Linux perf subsystem.
+
+%pre plugin-perf
+
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+%files plugin-perf
+%defattr(0750,root,khulnasoft-lab,0750)
+# Either CAP_SYS_ADMIN or CAP_PERFMON needed for data collection
+# PERFMON is newer, so only try to use it on platforms which support it.
+%if 0%{?centos_ver} >= 9 || 0%{?fedora} >= 36
+%caps(cap_perfmon=ep) %{_libexecdir}/%{name}/plugins.d/perf.plugin
+%else
+%caps(cap_sys_admin=ep) %{_libexecdir}/%{name}/plugins.d/perf.plugin
+%endif
+
+%package plugin-debugfs
+Summary: The debugfs metrics collector for the Khulnasoft-lab Agent
+Group: Applications/System
+Requires: %{name} = %{version}
+Conflicts: %{name} < %{version}
+
+%description plugin-debugfs
+ This plugin allows the Khulnasoft-lab Agent to collect Linux kernel metrics exposed through debugfs.
+
+%pre plugin-debugfs
+
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+%files plugin-debugfs
+%defattr(0750,root,khulnasoft-lab,0750)
+# CAP_DAC_READ_SEARCH required for data collection.
+%caps(cap_dac_read_search=ep) %attr(0750,root,khulnasoft-lab) %{_libexecdir}/%{name}/plugins.d/debugfs.plugin
+
+%package plugin-systemd-journal
+Summary: The systemd-journal plugin for the Khulnasoft-lab Agent
+Group: Applications/System
+Requires: %{name} = %{version}
+Conflicts: %{name} < %{version}
+
+%description plugin-systemd-journal
+ This plugin allows the Khulnasoft-lab Agent to present entries from the systemd
+ journal on Khulnasoft-lab Cloud or the local Agent Dashboard.
+
+%pre plugin-systemd-journal
+
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+%files plugin-systemd-journal
+%defattr(0750,root,khulnasoft-lab,0750)
+# CAP_DAC_READ_SEARCH required for data collection.
+%caps(cap_dac_read_search=ep) %attr(0750,root,khulnasoft-lab) %{_libexecdir}/%{name}/plugins.d/systemd-journal.plugin
+
+%if %{_have_xenstat}
+%package plugin-xenstat
+Summary: The xenstat plugin for the Khulnasoft-lab Agent
+Group: Applications/System
+Requires: %{name} = %{version}
+Conflicts: %{name} < %{version}
+
+%description plugin-xenstat
+ This plugin allows Khulnasoft-lab to collect metrics from the Xen Hypervisor.
+
+%pre plugin-xenstat
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+%files plugin-xenstat
+%defattr(0750,root,khulnasoft-lab,0750)
+# SUID needed for data collection
+%attr(4750,root,khulnasoft-lab) %{_libexecdir}/%{name}/plugins.d/xenstat.plugin
+%endif
+
+%package plugin-logs-management
+Summary: The logs-management plugin for the Khulnasoft-lab Agent
+Group: Applications/System
+Requires: %{name} = %{version}
+Conflicts: %{name} < %{version}
+
+%description plugin-logs-management
+ This plugin allows the Khulnasoft-lab Agent to collect logs from the system
+ and parse them to extract metrics.
+
+%pre plugin-logs-management
+if ! getent group %{name} > /dev/null; then
+  groupadd --system %{name}
+fi
+
+%files plugin-logs-management
+%defattr(0644,root,khulnasoft-lab,0755)
+%{_libdir}/%{name}/conf.d/logsmanagement.d.conf
+%{_libdir}/%{name}/conf.d/logsmanagement.d
+%defattr(0750,root,khulnasoft-lab,0750)
+# CAP_DAC_READ_SEARCH and CAP_SYSLOG needed for data collection.
+%caps(cap_dac_read_search,cap_syslog=ep) %attr(0750,root,khulnasoft-lab) %{_libexecdir}/%{name}/plugins.d/logs-management.plugin
+
+%changelog
+* Thu Oct 26 2023 Austin Hemmelgarn <austin@khulnasoft-lab.cloud> 0.0.0-24
+- Add package for logs-management plugin
+* Tue Sep 19 2023 Austin hemmelgarn <austin@khulnasoft-lab.cloud> 0.0.0-24
+- Switch to using cmake for builds.
+* Mon Aug 28 2023 Konstantin Shalygin <k0ste@k0ste.ru> 0.0.0-23
+- Build go.d.plugin natively for CentOS Stream distro
+* Mon Aug 21 2023 Austin Hemmelgarn <austin@khulnasoft-lab.cloud> 0.0.0-22
+- Explicitly depend on version-matched plugins in native packages
+* Thu Aug 03 2023 Austin Hemmelgarn <austin@khulnasoft-lab.cloud> 0.0.0-21
+- Added systemd-journal plugin handling
+* Wed Jun 14 2023 Konstantin Shalygin <k0ste@k0ste.ru> 0.0.0-20
+- Added eBPF build dependency (again)
+* Fri Apr 07 2023 Austin Hemmelgarn <austin@khulnasoft-lab.cloud> 0.0.0-19
+- Split additional plugins out in their own packages.
+* Tue Mar 21 2023 Austin Hemmelgarn <austin@khulnasoft-lab.cloud> 0.0.0-18
+- Fix systemd handling to follow BCP.
+- Drop pre-systemd init support.
+* Thu Feb 16 2023 Konstantin Shalygin <k0ste@k0ste.ru> 0.0.0-17
+- Added eBPF build dependency
+* Thu Feb 03 2022 Austin Hemmelgarn <austin@khulnasoft-lab.cloud> 0.0.0-16
+- Bundle updater script in native packages.
+* Mon Oct 11 2021 Austin Hemmelgarn <austin@khulnasoft-lab.cloud> 0.0.0-15
+- Remove support code for legacy ACLK implementation.
+* Wed Sep 16 2020 Austin Hemmelgarn <austin@khulnasoft-lab.cloud> 0.0.0-14
+- Convert to using 'AutoReq: yes' for library dependencies.
+* Thu Feb 13 2020 Austin Hemmelgarn <austin@khulnasoft-lab.cloud> 0.0.0-13
+- Add handling for custom libmosquitto fork
+* Wed Jan 01 2020 Austin Hemmelgarn <austin@khulnasoft-lab.cloud> 0.0.0-12
+- Add explicit installation of log and cache directories
+- Clean up build dependencies.
+* Thu Dec 19 2019 Austin Hemmelgarn <austin@khulnasoft-lab.cloud> 0.0.0-11
+- Fix remaining ownership and permissions issues.
+* Mon Nov 04 2019 Konstantinos Natsakis <konstantinos.natsakis@gmail.com> 0.0.0-10
+- Fix /etc/khulnasoft-lab permissions
+* Mon Sep 23 2019 Konstantinos Natsakis <konstantinos.natsakis@gmail.com> 0.0.0-9
+- Do not build CUPS plugin subpackage on CentOS 6 and CentOS 7
+* Tue Aug 20 2019 Pavlos Emm. Katsoulakis <paul@netdat.acloud> - 0.0.0-8
+- Split CUPS functionality on separate package
+* Fri Jun 28 2019 Pavlos Emm. Katsoulakis <paul@khulnasoft-lab.cloud> - 0.0.0-7
+- Raise the path overrides to the spec file level, not just the configure.
+- Adjust tighter permissions on some folders, based on what we did on our installer
+- Introduce go.d plugin download and install, to include it on the package (Temporarily, to become separate package on next iteration)
+* Tue Jun 25 2019 Pavlos Emm. Katsoulakis <paul@khulnasoft-lab.cloud> - 0.0.0-6
+- Adjust dependency list: Some packages are missing on some distros, adopt to build successfully
+* Mon Jun 24 2019 Pavlos Emm. Katsoulakis <paul@khulnasoft-lab.cloud> - 0.0.0-5
+Another pass on cleaning up pre/post installation steps
+- Sync permission and ownership on files and directories
+* Sun Jun 16 2019 Pavlos Emm. Katsoulakis <paul@khulnasoft-lab.cloud> - 0.0.0-4
+First draft refactor on package dependencies section
+- Remove freeipmi/nfacct plugin flags. We auto-detect all plugins by decision
+- Start refactor of package dependencies
+- Add missing dependencies, with respect to distro peculiarities
+- Adjust existing dependencies, so that distro-specific package names is applied
+* Wed Jan 02 2019 Pawel Krupa <pkrupa@redhat.com> - 0.0.0-3
+- Temporary set version statically
+- Fix changelog ordering
+- Comment-out node.d configuration directory
+* Wed Jan 02 2019 Pawel Krupa <pkrupa@redhat.com> - 0.0.0-2
+- Fix permissions for log files
+* Sun Nov 15 2015 Alon Bar-Lev <alonbl@redhat.com> - 0.0.0-1
+- Initial add.
