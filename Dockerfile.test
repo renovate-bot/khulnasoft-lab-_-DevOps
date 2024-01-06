@@ -1,0 +1,74 @@
+# NOTE: This Dockerfile (`Dockerfile.test`) should only be used for dev/testing
+#       and *NOT* in production. Use the top-level `Dockerfile` which points to
+#       `./packaging/docker/Dockerfile`.
+#
+# TODO: Create a khulnasoft-lab/package-builder:alpine9
+#FROM khulnasoft-lab/package-builder:alpine AS build
+FROM alpine:3.9 AS build
+
+# Install Dependencies
+RUN apk add --no-cache -U alpine-sdk bash curl libuv-dev zlib-dev \
+                          util-linux-dev libmnl-dev gcc make git autoconf \
+                          automake pkgconfig python logrotate openssl-dev \
+			  cmake
+
+# Pass optional ./khulnasoft-lab-installer.sh args with --build-arg INSTALLER_ARGS=...
+ARG INSTALLER_ARGS=""
+
+# Copy Sources
+# Can also bind-mount sources with:
+# $ docker run -v $PWD:/khulnasoft-lab
+
+WORKDIR /khulnasoft-lab
+COPY . .
+
+# Build
+RUN ./khulnasoft-lab-installer.sh --dont-wait --dont-start-it --disable-go "${INSTALLER_ARGS}"
+
+FROM alpine:3.9 AS runtime
+
+# Install runtime dependencies
+RUN apk --no-cache -U add curl bash libuv zlib util-linux libmnl python
+
+# Create khulnasoft-lab user/group
+RUN addgroup -S khulnasoft-lab && \
+	adduser -D -S -h /var/empty -s /bin/false -G khulnasoft-lab khulnasoft-lab
+
+# Copy binary from build layer
+COPY --from=build /usr/sbin/khulnasoft-lab /usr/sbin/khulnasoft-lab
+
+# Copy configuration files from build layer
+COPY --from=build /etc/khulnasoft-lab/ /etc/khulnasoft-lab/
+COPY --from=build /usr/lib/khulnasoft-lab/ /usr/lib/khulnasoft-lab/
+
+# Copy assets from build layer
+COPY --from=build /usr/share/khulnasoft-lab/ /usr/share/khulnasoft-lab/
+
+# Create some directories khulnasoft-lab needs
+RUN mkdir -p \
+	/etc/khulnasoft-lab \
+	/var/log/khulnasoft-lab \
+	/var/lib/khulnasoft-lab \
+	/var/cache/khulnasoft-lab \
+	/usr/lib/khulnasoft-lab/conf.d \
+	/usr/libexec/khulnasoft-lab/plugins.d
+
+# Fix permissions/ownerships
+RUN chown -R khulnasoft-lab:khulnasoft-lab \
+	/etc/khulnasoft-lab/ \
+	/usr/lib/khulnasoft-lab/ \
+	/usr/share/khulnasoft-lab/ \
+	/var/log/khulnasoft-lab \
+	/var/lib/khulnasoft-lab \
+	/var/cache/khulnasoft-lab  \
+	/usr/libexec/khulnasoft-lab
+
+VOLUME /etc/khulnasoft-lab
+VOLUME /var/lib/khulnasoft-lab
+VOLUME /var/log/khulnasoft-lab
+
+EXPOSE 19999/tcp
+
+USER khulnasoft-lab
+
+CMD ["/usr/sbin/khulnasoft-lab", "-D"]
