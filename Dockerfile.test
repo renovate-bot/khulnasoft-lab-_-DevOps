@@ -4,7 +4,7 @@
 #
 # TODO: Create a khulnasoft-lab/package-builder:alpine9
 #FROM khulnasoft-lab/package-builder:alpine AS build
-FROM alpine:3.9 AS build
+FROM alpine:3.21 AS build
 
 # Install Dependencies
 RUN apk add --no-cache -U alpine-sdk bash curl libuv-dev zlib-dev \
@@ -25,7 +25,7 @@ COPY . .
 # Build
 RUN ./khulnasoft-lab-installer.sh --dont-wait --dont-start-it --disable-go "${INSTALLER_ARGS}"
 
-FROM alpine:3.9 AS runtime
+FROM alpine:3.21 AS runtime
 
 # Install runtime dependencies
 RUN apk --no-cache -U add curl bash libuv zlib util-linux libmnl python
